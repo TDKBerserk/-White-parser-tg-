@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
 """
-update_whitelist_ranges.py
+update_whitelist_ranges.py — v2
 
-Собирает белый список IP/CIDR-подсетей сервисов, которые остаются
-доступны в режиме ограниченного интернета (нулевой рейтинг / "белые списки"
-операторов вроде YOTA): Яндекс, ВКонтакте, Mail.ru, Rutube и т.д. — берём
-готовые актуальные подсети из открытого репозитория vattik/ipranges.
+Собирает данные для определения "белых" конфигов (тех, что маскируются
+под трафик, пропускаемый в режиме ограниченного интернета операторов
+вроде YOTA).
 
-Для сервисов без готового CIDR-списка (например, MAX) — резолвим домены
-через DNS и добавляем полученные IP как /32 (для IPv4) и /128 (для IPv6).
+Вместо привязки к спискам конкретных сервисов (Яндекс/ВК/CDN) используется
+связка из двух файлов, которую поддерживает открытый проект
+RKPchannel/RKP_bypass_configs (https://github.com/RKPchannel/RKP_bypass_configs):
 
-Результат пишется в whitelist_ips.txt — плоский список CIDR, по одному
-на строку, с комментариями-заголовками по сервисам. Пустые строки и
-строки, начинающиеся с '#', игнорируются коллектором.
+  - ip_list.txt  — первые ДВА октета IP (напр. "5.44"), покрывающие
+    диапазоны, которые реально пропускаются при включённом "белом
+    списке" — это официальный/наблюдаемый список, а не наш подбор.
+  - sni_list.txt — список доменов (SNI), которые тоже пропускаются
+    в этом режиме.
 
-Источники подсетей (vattik/ipranges, https://github.com/vattik/ipranges):
-  - google, mail.ru, ru-government, rutube, valve, vkontakte, yandex
-Домены для DNS-резолва (сервисы без готового списка): задаются в
-whitelist_domains.txt (по одному домену на строку, поддержка '#'-комментариев).
+Конфиг считается "белым" (в collector.py), только если ОДНОВРЕМЕННО:
+  1) первые два октета его IP входят в ip_list.txt, И
+  2) его SNI/домен входит в sni_list.txt (с учётом поддоменов).
+
+Если совпадает только одно из двух условий или ни одного — конфиг
+классифицируется как чёрный.
+
+Дополнительно: домены сервисов без записи в готовых списках (например,
+MAX) можно добавить вручную в whitelist_domains.txt — они добавляются
+в sni-список как есть, а их резолвленные IP — как префиксы в ip-список.
+
+Результат:
+  whitelist_ip_prefixes.txt — первые два октета IP, по одному на строку
+  whitelist_sni.txt         — домены, по одному на строку
 """
 
 import socket
@@ -25,16 +37,15 @@ import sys
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
-# Готовые списки CIDR из vattik/ipranges: (Название для комментария, URL)
-IPRANGES_SOURCES = [
-    ("Yandex", "https://raw.githubusercontent.com/vattik/ipranges/main/yandex/yandex.txt"),
-    ("VKontakte", "https://raw.githubusercontent.com/vattik/ipranges/main/vkontakte/vkontakte.txt"),
-    ("Mail.Ru and Odnoklassniki", "https://raw.githubusercontent.com/vattik/ipranges/main/mail.ru/mail.ru.txt"),
-    ("Rutube", "https://raw.githubusercontent.com/vattik/ipranges/main/rutube/rutube.txt"),
-]
+IP_LIST_URL = "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/ip_list.txt"
+SNI_LIST_URL = "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/sni_list.txt"
 
-# Домены сервисов без готового CIDR-списка — резолвим сами через DNS.
-DEFAULT_DOMAINS = {
+DOMAINS_FILE = "whitelist_domains.txt"
+OUT_IP_PREFIXES = "whitelist_ip_prefixes.txt"
+OUT_SNI = "whitelist_sni.txt"
+
+# Домены сервисов без записи в готовых списках — добавляем вручную
+DEFAULT_EXTRA_DOMAINS = {
     "MAX": [
         "max.ru",
         "platform-api2.max.ru",
@@ -43,10 +54,8 @@ DEFAULT_DOMAINS = {
     ],
 }
 
-DOMAINS_FILE = "whitelist_domains.txt"
-OUTPUT_FILE = "whitelist_ips.txt"
 USER_AGENT = "Mozilla/5.0 (White-parser-tg whitelist updater)"
-TIMEOUT = 15
+TIMEOUT = 20
 
 
 def fetch_text(url: str) -> str:
@@ -55,106 +64,89 @@ def fetch_text(url: str) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def parse_cidr_lines(raw: str) -> list[str]:
-    lines = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        lines.append(line)
-    return lines
+def clean_lines(raw: str) -> list[str]:
+    return [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
 
 
 def load_extra_domains() -> dict:
-    """Читает whitelist_domains.txt, если он есть, в формате:
-    # Заголовок сервиса
-    domain1.example
-    domain2.example
-    Возвращает dict {service_name: [domains]}, дополняющий DEFAULT_DOMAINS.
-    """
     extra = {}
     try:
         with open(DOMAINS_FILE, "r", encoding="utf-8") as f:
-            current_service = "Custom"
+            current = "Custom"
             for raw_line in f:
                 line = raw_line.strip()
                 if not line:
                     continue
                 if line.startswith("#"):
-                    current_service = line.lstrip("#").strip() or current_service
+                    current = line.lstrip("#").strip() or current
                     continue
-                extra.setdefault(current_service, []).append(line)
+                extra.setdefault(current, []).append(line)
     except FileNotFoundError:
         pass
     return extra
 
 
-def resolve_domain(domain: str) -> list[str]:
-    ips = set()
+def resolve_ip_prefixes(domain: str) -> list[str]:
+    prefixes = set()
     try:
         _, _, ipv4_list = socket.gethostbyname_ex(domain)
-        ips.update(ipv4_list)
+        for ip in ipv4_list:
+            parts = ip.split(".")
+            if len(parts) == 4:
+                prefixes.add(f"{parts[0]}.{parts[1]}")
     except (socket.gaierror, socket.herror) as e:
-        print(f"  [warn] не удалось резолвить {domain} (IPv4): {e}", file=sys.stderr)
-
-    try:
-        for info in socket.getaddrinfo(domain, None, socket.AF_INET6):
-            ips.add(info[4][0])
-    except (socket.gaierror, socket.herror):
-        pass  # IPv6 может отсутствовать — не критично
-
-    return sorted(ips)
-
-
-def to_cidr(ip: str) -> str:
-    return f"{ip}/32" if "." in ip else f"{ip}/128"
+        print(f"  [warn] не удалось резолвить {domain}: {e}", file=sys.stderr)
+    return sorted(prefixes)
 
 
 def main():
-    sections: list[tuple[str, list[str]]] = []
+    ip_prefixes: set[str] = set()
+    sni_domains: set[str] = set()
 
-    print("Скачиваю готовые CIDR-списки из vattik/ipranges...")
-    for name, url in IPRANGES_SOURCES:
-        try:
-            raw = fetch_text(url)
-            cidrs = parse_cidr_lines(raw)
-            print(f"  [ok] {name}: {len(cidrs)} подсетей")
-            sections.append((name, cidrs))
-        except (URLError, HTTPError, TimeoutError) as e:
-            print(f"  [error] {name} ({url}): {e}", file=sys.stderr)
+    print("Скачиваю ip_list.txt из RKPchannel/RKP_bypass_configs...")
+    try:
+        ip_prefixes.update(clean_lines(fetch_text(IP_LIST_URL)))
+        print(f"  [ok] получено {len(ip_prefixes)} префиксов")
+    except (URLError, HTTPError, TimeoutError) as e:
+        print(f"  [error] не удалось скачать ip_list.txt: {e}", file=sys.stderr)
 
-    print("Резолвлю домены сервисов без готового списка (MAX и др.)...")
-    domains_by_service = dict(DEFAULT_DOMAINS)
+    print("Скачиваю sni_list.txt из RKPchannel/RKP_bypass_configs...")
+    try:
+        sni_domains.update(clean_lines(fetch_text(SNI_LIST_URL)))
+        print(f"  [ok] получено {len(sni_domains)} доменов")
+    except (URLError, HTTPError, TimeoutError) as e:
+        print(f"  [error] не удалось скачать sni_list.txt: {e}", file=sys.stderr)
+
+    print("Добавляю доп. сервисы без готовых списков (MAX и др.)...")
+    extra_domains = dict(DEFAULT_EXTRA_DOMAINS)
     for service, domains in load_extra_domains().items():
-        domains_by_service.setdefault(service, []).extend(domains)
+        extra_domains.setdefault(service, []).extend(domains)
 
-    for service, domains in domains_by_service.items():
-        cidrs = []
+    for service, domains in extra_domains.items():
         for domain in domains:
-            ips = resolve_domain(domain)
-            if ips:
-                print(f"  [ok] {domain}: {', '.join(ips)}")
+            sni_domains.add(domain)
+            prefixes = resolve_ip_prefixes(domain)
+            if prefixes:
+                print(f"  [ok] {service}/{domain}: префиксы {', '.join(prefixes)}")
+                ip_prefixes.update(prefixes)
             else:
-                print(f"  [warn] {domain}: IP не получены", file=sys.stderr)
-            cidrs.extend(to_cidr(ip) for ip in ips)
-        if cidrs:
-            sections.append((service, sorted(set(cidrs))))
+                print(f"  [warn] {service}/{domain}: IP не получены (только SNI-запись)", file=sys.stderr)
 
-    total = sum(len(cidrs) for _, cidrs in sections)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
-        out.write("# whitelist_ips.txt — автосгенерировано update_whitelist_ranges.py\n")
-        out.write("# Источники: github.com/vattik/ipranges + DNS-резолв доменов (MAX и др.)\n")
-        out.write("# Не редактировать вручную — правки будут перезаписаны при следующем запуске.\n")
-        out.write(f"# Не перезаписывать этот файл вручную. Доп. домены — в {DOMAINS_FILE}\n\n")
-        for name, cidrs in sections:
-            if not cidrs:
-                continue
-            out.write(f"# {name}\n")
-            for cidr in cidrs:
-                out.write(f"{cidr}\n")
-            out.write("\n")
+    with open(OUT_IP_PREFIXES, "w", encoding="utf-8") as f:
+        f.write("# whitelist_ip_prefixes.txt — автосгенерировано update_whitelist_ranges.py\n")
+        f.write("# Источник: github.com/RKPchannel/RKP_bypass_configs (ip_list.txt) + доп. домены\n")
+        f.write("# Не редактировать вручную — правки перезапишутся при следующем запуске.\n\n")
+        for prefix in sorted(ip_prefixes):
+            f.write(f"{prefix}\n")
 
-    print(f"Готово: {OUTPUT_FILE} — {total} подсетей из {len(sections)} источников.")
+    with open(OUT_SNI, "w", encoding="utf-8") as f:
+        f.write("# whitelist_sni.txt — автосгенерировано update_whitelist_ranges.py\n")
+        f.write("# Источник: github.com/RKPchannel/RKP_bypass_configs (sni_list.txt) + доп. домены\n")
+        f.write("# Не редактировать вручную — правки перезапишутся при следующем запуске.\n\n")
+        for domain in sorted(sni_domains):
+            f.write(f"{domain}\n")
+
+    print(f"Готово: {OUT_IP_PREFIXES} ({len(ip_prefixes)} префиксов), {OUT_SNI} ({len(sni_domains)} доменов).")
 
 
 if __name__ == "__main__":
