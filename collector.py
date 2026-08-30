@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """
-collector.py — White-parser-tg
+collector.py — White-parser-tg (v2)
 
-Собирает VPN-подписки/ключи из Telegram-каналов (channels.txt), проверяет
-их через HTTP GET, и делит на белый/чёрный список по IP сервера:
+Собирает VPN-ключи из Telegram-каналов (channels.txt), проверяет их через
+HTTP GET, и делит на белый/чёрный список по связке IP-префикс + SNI:
 
-  - "Белый" — IP сервера входит в whitelist_ips.txt (подсети сервисов,
-    доступных в режиме ограниченного интернета: Яндекс, ВК, MAX и т.д.).
-    Такой конфиг маскируется под разрешённый трафик.
-  - "Чёрный" — всё остальное (обычный обход блокировок при доступном
-    интернете).
+  "Белый"  — первые два октета IP сервера входят в whitelist_ip_prefixes.txt
+             И SNI/домен конфига входит в whitelist_sni.txt (оба условия
+             одновременно). Такой конфиг маскируется под трафик, который
+             пропускается в режиме ограниченного интернета (см. README).
+  "Чёрный" — всё остальное (обычный обход блокировок при доступном
+             интернете).
 
-Источники берутся ТОЛЬКО из Telegram-каналов (без внешнего sources.txt):
-  1. Публичная страница https://t.me/s/<channel> парсится на предмет:
-     а) прямых ключей-URI (vless://, trojan://, ss://, vmess://);
-     б) http(s)-ссылок на подписки — они скачиваются через HTTP GET,
-        декодируются (base64 или plain text), и из них также
-        извлекаются ключи.
-  2. Каждый найденный ключ проверяется на доступность через HTTP GET
-     к host:port сервера (см. check_alive).
-  3. Живые ключи резолвятся в IP и сверяются с whitelist_ips.txt.
+whitelist_ip_prefixes.txt и whitelist_sni.txt генерируются отдельным
+скриптом update_whitelist_ranges.py (источник — открытый список
+RKPchannel/RKP_bypass_configs), запускать его нужно ПЕРЕД коллектором.
 
-Результат пишется в output/:
+Источники ключей — ТОЛЬКО Telegram-каналы (без внешнего sources.txt):
+  1. Публичная страница https://t.me/s/<channel>: прямые ключи-URI
+     (vless://, trojan://, ss://, vmess://) и http(s)-ссылки на подписки.
+  2. Ссылки-подписки скачиваются через HTTP GET и разбираются на ключи
+     (с попыткой base64-декодирования).
+  3. Каждый ключ проверяется на доступность через HTTP GET к host:port.
+  4. Живые ключи из ПРЕДЫДУЩЕГО запуска (output/all_configs.txt) тоже
+     подмешиваются в проверку — если источники временно недоступны,
+     рабочие конфиги не теряются между циклами.
+
+Результат в output/:
   white_configs.txt, black_configs.txt, all_configs.txt,
   white_base64.txt, black_base64.txt, summary.json
 """
@@ -31,25 +36,26 @@ import json
 import re
 import socket
 import sys
-import ipaddress
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 import requests
 
 CHANNELS_FILE = "channels.txt"
-WHITELIST_FILE = "whitelist_ips.txt"
+WHITELIST_IP_FILE = "whitelist_ip_prefixes.txt"
+WHITELIST_SNI_FILE = "whitelist_sni.txt"
 OUTPUT_DIR = Path("output")
 
 TELEGRAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 HTTP_TIMEOUT = 10
 CHECK_TIMEOUT = 5
+IPAPI_BATCH_URL = "http://ip-api.com/batch"
+IPAPI_BATCH_SIZE = 100
 
 KEY_PREFIXES = ("vless://", "trojan://", "ss://", "vmess://")
 
-# Заведомый мусор в постах Telegram — не тянем такие ссылки как подписки
 LINK_JUNK_MARKERS = (
     "t.me/", "telegram.org", "telesco.pe",
     ".jpg", ".jpeg", ".png", ".gif", ".webp",
@@ -81,10 +87,7 @@ def is_junk_link(url: str) -> bool:
 
 
 def extract_from_html(html: str) -> tuple[set[str], set[str]]:
-    """Возвращает (прямые_ключи, ссылки_на_подписки) найденные в тексте постов."""
-    direct_keys = set()
-    sub_links = set()
-
+    direct_keys, sub_links = set(), set()
     for line in html.splitlines():
         for match in KEY_RE.findall(line):
             direct_keys.add(match.rstrip('"\'<>).,'))
@@ -92,12 +95,10 @@ def extract_from_html(html: str) -> tuple[set[str], set[str]]:
             clean = match.rstrip('"\'<>).,')
             if not is_junk_link(clean):
                 sub_links.add(clean)
-
     return direct_keys, sub_links
 
 
 def fetch_subscription(url: str) -> set[str]:
-    """Скачивает содержимое ссылки-подписки и извлекает из неё ключи."""
     try:
         resp = requests.get(url, headers={"User-Agent": TELEGRAM_UA}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
@@ -105,9 +106,6 @@ def fetch_subscription(url: str) -> set[str]:
     except requests.RequestException:
         return set()
 
-    keys = set()
-
-    # Пытаемся как base64 (частый формат для подписок)
     try:
         padded = raw.strip() + "=" * (-len(raw.strip()) % 4)
         decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
@@ -116,14 +114,23 @@ def fetch_subscription(url: str) -> set[str]:
     except Exception:
         pass
 
-    for match in KEY_RE.findall(raw):
-        keys.add(match.strip().rstrip('"\'<>).,'))
+    return {m.strip().rstrip('"\'<>).,') for m in KEY_RE.findall(raw)}
 
-    return keys
+
+def load_previous_keys() -> set[str]:
+    """Подмешивает ключи из результата прошлого запуска, чтобы не терять
+    рабочие конфиги, если источники временно недоступны."""
+    path = OUTPUT_DIR / "all_configs.txt"
+    if not path.exists():
+        return set()
+    try:
+        return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except Exception:
+        return set()
 
 
 # --------------------------------------------------------------------------
-# Разбор ключей: извлечение host:port
+# Разбор ключей: host:port и SNI
 # --------------------------------------------------------------------------
 
 def parse_host_port(key: str) -> tuple[str, int] | None:
@@ -132,18 +139,13 @@ def parse_host_port(key: str) -> tuple[str, int] | None:
             payload = key[len("vmess://"):]
             payload += "=" * (-len(payload) % 4)
             data = json.loads(base64.b64decode(payload).decode("utf-8", errors="ignore"))
-            host = data.get("add")
-            port = int(data.get("port"))
-            if host and port:
-                return host, port
-            return None
+            host, port = data.get("add"), int(data.get("port"))
+            return (host, port) if host and port else None
 
-        # vless / trojan / ss (URI-формат host:port в netloc)
         parsed = urlparse(key)
         if parsed.hostname and parsed.port:
             return parsed.hostname, parsed.port
 
-        # ss:// старого формата ss://base64(method:pass@host:port)
         if key.startswith("ss://"):
             body = key[len("ss://"):].split("#")[0]
             if "@" not in body:
@@ -158,37 +160,47 @@ def parse_host_port(key: str) -> tuple[str, int] | None:
         return None
 
 
+def parse_sni(key: str) -> str | None:
+    """Извлекает SNI-домен из конфига: параметр sni= (vless/trojan reality/tls),
+    иначе host= (websocket host header), иначе — сам hostname, если это не IP."""
+    try:
+        if key.startswith("vmess://"):
+            payload = key[len("vmess://"):]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.b64decode(payload).decode("utf-8", errors="ignore"))
+            return data.get("sni") or data.get("host") or None
+
+        parsed = urlparse(key)
+        qs = parse_qs(parsed.query)
+        for param in ("sni", "host", "peer"):
+            if param in qs and qs[param][0]:
+                return qs[param][0]
+
+        # Fallback: hostname сам по себе, если это домен, а не IP
+        if parsed.hostname:
+            try:
+                socket.inet_aton(parsed.hostname)
+                return None  # это IP, не домен — SNI неизвестен
+            except OSError:
+                return parsed.hostname
+        return None
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # Проверка доступности через HTTP GET
 # --------------------------------------------------------------------------
 
 def check_alive(host: str, port: int) -> bool:
-    """Проверяет отзывчивость host:port через HTTP GET.
-
-    Прокси-протоколы (vless/trojan/ss/vmess) не говорят на HTTP, поэтому
-    полноценного HTTP-ответа чаще всего не будет — но сама попытка
-    установить соединение и получить любой ответ/явный отказ от сервиса
-    (а не таймаут/RST при отсутствии сервиса на порту) говорит о том,
-    что порт слушает и сервер жив.
-    """
     for scheme in ("http", "https"):
         try:
-            requests.get(
-                f"{scheme}://{host}:{port}/",
-                timeout=CHECK_TIMEOUT,
-                verify=False,
-            )
-            return True  # получили HTTP-ответ любого рода — сервер отвечает
+            requests.get(f"{scheme}://{host}:{port}/", timeout=CHECK_TIMEOUT, verify=False)
+            return True
         except requests.exceptions.SSLError:
-            return True  # TLS-хендшейк начался — порт открыт и слушает
+            return True
         except requests.exceptions.ConnectionError as e:
-            # "Connection reset"/"Connection refused сразу после connect"
-            # обычно означает, что порт открыт, но не говорит по HTTP —
-            # это нормально для vless/trojan/vmess. Явный refused/timeout
-            # на уровне TCP — недоступен.
             msg = str(e).lower()
-            if "refused" in msg and "reset" not in msg:
-                continue
             if "reset" in msg:
                 return True
             continue
@@ -201,9 +213,9 @@ def check_alive(host: str, port: int) -> bool:
 
 def resolve_ip(host: str) -> str | None:
     try:
-        ipaddress.ip_address(host)
+        socket.inet_aton(host)
         return host
-    except ValueError:
+    except OSError:
         pass
     try:
         return socket.gethostbyname(host)
@@ -212,43 +224,94 @@ def resolve_ip(host: str) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# Белый/чёрный список
+# Белый/чёрный список: IP-префикс + SNI
 # --------------------------------------------------------------------------
 
-def load_whitelist_networks(path: str) -> list:
-    networks = []
+def load_ip_prefixes(path: str) -> set[str]:
+    prefixes = set()
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    networks.append(ipaddress.ip_network(line, strict=False))
-                except ValueError:
-                    continue
+                if line and not line.startswith("#"):
+                    prefixes.add(line)
     except FileNotFoundError:
         print(f"  [warn] {path} не найден — все конфиги попадут в чёрный список. "
               f"Запусти update_whitelist_ranges.py перед сбором.", file=sys.stderr)
-    return networks
+    return prefixes
 
 
-def classify(ip_str: str, networks: list) -> str:
+def load_sni_domains(path: str) -> set[str]:
+    domains = set()
     try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return "black"
-    for net in networks:
-        if ip in net:
-            return "white"
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip().lower()
+                if line and not line.startswith("#"):
+                    domains.add(line)
+    except FileNotFoundError:
+        print(f"  [warn] {path} не найден — все конфиги попадут в чёрный список.", file=sys.stderr)
+    return domains
+
+
+def ip_prefix_matches(ip: str, prefixes: set[str]) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    return f"{parts[0]}.{parts[1]}" in prefixes
+
+
+def sni_matches(sni: str | None, domains: set[str]) -> bool:
+    if not sni:
+        return False
+    sni = sni.lower()
+    labels = sni.split(".")
+    for i in range(len(labels) - 1):
+        if ".".join(labels[i:]) in domains:
+            return True
+    return False
+
+
+def classify(ip: str, sni: str | None, ip_prefixes: set[str], sni_domains: set[str]) -> str:
+    if ip_prefix_matches(ip, ip_prefixes) and sni_matches(sni, sni_domains):
+        return "white"
     return "black"
+
+
+# --------------------------------------------------------------------------
+# Переименование с указанием страны (ip-api.com, батчами)
+# --------------------------------------------------------------------------
+
+def lookup_countries(ips: list[str]) -> dict[str, str]:
+    countries = {}
+    unique_ips = list(dict.fromkeys(ips))
+    for i in range(0, len(unique_ips), IPAPI_BATCH_SIZE):
+        batch = unique_ips[i:i + IPAPI_BATCH_SIZE]
+        try:
+            resp = requests.post(IPAPI_BATCH_URL, json=[{"query": ip, "fields": "query,countryCode"} for ip in batch],
+                                  timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            for entry in resp.json():
+                if entry.get("countryCode"):
+                    countries[entry["query"]] = entry["countryCode"]
+        except Exception as e:
+            print(f"  [warn] ip-api.com батч не удался: {e}", file=sys.stderr)
+    return countries
+
+
+def rename_key(key: str, country: str | None, category: str) -> str:
+    base = key.split("#")[0]
+    label = "White" if category == "white" else "Black"
+    tag = f"{label} | {country or '??'} | White-parser-tg"
+    from urllib.parse import quote
+    return f"{base}#{quote(tag)}"
 
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
-def process_key(key: str, networks: list) -> dict | None:
+def process_key(key: str, ip_prefixes: set[str], sni_domains: set[str]) -> dict | None:
     hp = parse_host_port(key)
     if not hp:
         return None
@@ -261,8 +324,9 @@ def process_key(key: str, networks: list) -> dict | None:
     if not ip:
         return None
 
-    category = classify(ip, networks)
-    return {"key": key, "host": host, "port": port, "ip": ip, "category": category}
+    sni = parse_sni(key)
+    category = classify(ip, sni, ip_prefixes, sni_domains)
+    return {"key": key, "host": host, "port": port, "ip": ip, "sni": sni, "category": category}
 
 
 def main():
@@ -275,7 +339,8 @@ def main():
         line.strip() for line in Path(CHANNELS_FILE).read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    networks = load_whitelist_networks(WHITELIST_FILE)
+    ip_prefixes = load_ip_prefixes(WHITELIST_IP_FILE)
+    sni_domains = load_sni_domains(WHITELIST_SNI_FILE)
 
     all_direct_keys: set[str] = set()
     all_sub_links: set[str] = set()
@@ -299,49 +364,63 @@ def main():
         for fut in as_completed(futures):
             all_direct_keys.update(fut.result())
 
+    previous_keys = load_previous_keys()
+    if previous_keys:
+        print(f"Подмешиваю {len(previous_keys)} ключей из прошлого запуска для повторной проверки...")
+        all_direct_keys.update(previous_keys)
+
     print(f"Всего уникальных ключей: {len(all_direct_keys)}. Проверяю через HTTP GET...")
 
     results = []
     with ThreadPoolExecutor(max_workers=args.check_workers) as pool:
-        futures = {pool.submit(process_key, key, networks): key for key in all_direct_keys}
+        futures = {pool.submit(process_key, key, ip_prefixes, sni_domains): key for key in all_direct_keys}
         for fut in as_completed(futures):
             res = fut.result()
             if res:
                 results.append(res)
 
+    print(f"Живых конфигов: {len(results)}. Определяю страны для тегов...")
+    countries = lookup_countries([r["ip"] for r in results])
+    for r in results:
+        r["country"] = countries.get(r["ip"])
+        r["display_key"] = rename_key(r["key"], r["country"], r["category"])
+
     white = [r for r in results if r["category"] == "white"]
     black = [r for r in results if r["category"] == "black"]
 
-    print(f"Живых конфигов: {len(results)} (белых: {len(white)}, чёрных: {len(black)})")
+    print(f"Итого: белых {len(white)}, чёрных {len(black)}")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     def write_list(path: Path, items: list[dict]):
+        path.write_text("\n".join(r["display_key"] for r in items) + ("\n" if items else ""), encoding="utf-8")
+
+    def write_raw_list(path: Path, items: list[dict]):
+        """Без переименования — используется для carry-over между запусками."""
         path.write_text("\n".join(r["key"] for r in items) + ("\n" if items else ""), encoding="utf-8")
 
     def write_base64(path: Path, items: list[dict]):
-        blob = "\n".join(r["key"] for r in items)
+        blob = "\n".join(r["display_key"] for r in items)
         path.write_text(base64.b64encode(blob.encode("utf-8")).decode("ascii"), encoding="utf-8")
 
     write_list(OUTPUT_DIR / "white_configs.txt", white)
     write_list(OUTPUT_DIR / "black_configs.txt", black)
-    write_list(OUTPUT_DIR / "all_configs.txt", results)
+    write_raw_list(OUTPUT_DIR / "all_configs.txt", results)  # raw-ключи для carry-over
     write_base64(OUTPUT_DIR / "white_base64.txt", white)
     write_base64(OUTPUT_DIR / "black_base64.txt", black)
 
     summary = {
-        "total_keys_found": len(all_direct_keys),
+        "total_keys_checked": len(all_direct_keys),
         "alive": len(results),
         "white": len(white),
         "black": len(black),
         "channels": channels,
     }
-    (OUTPUT_DIR / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    (OUTPUT_DIR / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("Готово. Результаты в output/.")
 
 
 if __name__ == "__main__":
     main()
+
