@@ -192,23 +192,21 @@ def parse_sni(key: str) -> str | None:
 # Проверка доступности через HTTP GET
 # --------------------------------------------------------------------------
 
-def check_alive(host: str, port: int) -> bool:
-    for scheme in ("http", "https"):
-        try:
-            requests.get(f"{scheme}://{host}:{port}/", timeout=CHECK_TIMEOUT, verify=False)
-            return True
-        except requests.exceptions.SSLError:
-            return True
-        except requests.exceptions.ConnectionError as e:
-            msg = str(e).lower()
-            if "reset" in msg:
-                return True
-            continue
-        except requests.exceptions.Timeout:
-            continue
-        except Exception:
-            continue
-    return False
+def check_alive(ip: str, port: int) -> bool:
+    """Строгая проверка доступности: реальное TCP-соединение с ip:port.
+
+    Раньше здесь использовался HTTP GET с мягкими эвристиками (TCP-reset
+    считался "живым"), что пропускало много мёртвых серверов — reset
+    сам по себе ничего не доказывает. Теперь требуется successful
+    TCP-connect (socket.connect_ex == 0), это единственный надёжный
+    признак того, что сервис на порту реально слушает и отвечает.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(CHECK_TIMEOUT)
+            return sock.connect_ex((ip, port)) == 0
+    except (socket.timeout, OSError):
+        return False
 
 
 def resolve_ip(host: str) -> str | None:
@@ -279,8 +277,44 @@ def classify(ip: str, sni: str | None, ip_prefixes: set[str], sni_domains: set[s
 
 
 # --------------------------------------------------------------------------
-# Переименование с указанием страны (ip-api.com, батчами)
+# Переименование с указанием страны + флага (ip-api.com, батчами)
 # --------------------------------------------------------------------------
+
+# ISO 3166-1 alpha-2 -> русское название. Покрывает страны, типичные для
+# VPN-серверов; для кода, которого нет в словаре, используется сам код.
+COUNTRY_NAMES_RU = {
+    "AD": "Андорра", "AE": "ОАЭ", "AL": "Албания", "AM": "Армения", "AR": "Аргентина",
+    "AT": "Австрия", "AU": "Австралия", "AZ": "Азербайджан", "BA": "Босния и Герцеговина",
+    "BE": "Бельгия", "BG": "Болгария", "BR": "Бразилия", "BY": "Беларусь", "CA": "Канада",
+    "CH": "Швейцария", "CL": "Чили", "CN": "Китай", "CY": "Кипр", "CZ": "Чехия",
+    "DE": "Германия", "DK": "Дания", "EE": "Эстония", "EG": "Египет", "ES": "Испания",
+    "FI": "Финляндия", "FR": "Франция", "GB": "Великобритания", "GE": "Грузия",
+    "GR": "Греция", "HK": "Гонконг", "HR": "Хорватия", "HU": "Венгрия", "ID": "Индонезия",
+    "IE": "Ирландия", "IL": "Израиль", "IN": "Индия", "IS": "Исландия", "IT": "Италия",
+    "JP": "Япония", "KG": "Кыргызстан", "KR": "Южная Корея", "KZ": "Казахстан",
+    "LT": "Литва", "LU": "Люксембург", "LV": "Латвия", "MD": "Молдова", "ME": "Черногория",
+    "MK": "Северная Македония", "MT": "Мальта", "MX": "Мексика", "MY": "Малайзия",
+    "NL": "Нидерланды", "NO": "Норвегия", "NZ": "Новая Зеландия", "PH": "Филиппины",
+    "PL": "Польша", "PT": "Португалия", "RO": "Румыния", "RS": "Сербия", "RU": "Россия",
+    "SE": "Швеция", "SG": "Сингапур", "SI": "Словения", "SK": "Словакия", "TH": "Таиланд",
+    "TJ": "Таджикистан", "TM": "Туркменистан", "TR": "Турция", "TW": "Тайвань",
+    "UA": "Украина", "US": "США", "UZ": "Узбекистан", "VN": "Вьетнам", "ZA": "ЮАР",
+}
+
+
+def country_flag(code: str | None) -> str:
+    """Конвертирует ISO 3166-1 alpha-2 код страны в эмодзи-флаг
+    (пара regional indicator symbols)."""
+    if not code or len(code) != 2 or not code.isalpha():
+        return "🏳️"
+    return "".join(chr(127397 + ord(c)) for c in code.upper())
+
+
+def country_name_ru(code: str | None) -> str:
+    if not code:
+        return "Неизвестно"
+    return COUNTRY_NAMES_RU.get(code.upper(), code.upper())
+
 
 def lookup_countries(ips: list[str]) -> dict[str, str]:
     countries = {}
@@ -299,10 +333,11 @@ def lookup_countries(ips: list[str]) -> dict[str, str]:
     return countries
 
 
-def rename_key(key: str, country: str | None, category: str) -> str:
+def rename_key(key: str, country_code: str | None) -> str:
     base = key.split("#")[0]
-    label = "White" if category == "white" else "Black"
-    tag = f"{label} | {country or '??'} | White-parser-tg"
+    flag = country_flag(country_code)
+    name = country_name_ru(country_code)
+    tag = f"{flag} {name} | onyx-tg-parser"
     from urllib.parse import quote
     return f"{base}#{quote(tag)}"
 
@@ -317,11 +352,11 @@ def process_key(key: str, ip_prefixes: set[str], sni_domains: set[str]) -> dict 
         return None
     host, port = hp
 
-    if not check_alive(host, port):
-        return None
-
     ip = resolve_ip(host)
     if not ip:
+        return None
+
+    if not check_alive(ip, port):
         return None
 
     sni = parse_sni(key)
@@ -383,7 +418,7 @@ def main():
     countries = lookup_countries([r["ip"] for r in results])
     for r in results:
         r["country"] = countries.get(r["ip"])
-        r["display_key"] = rename_key(r["key"], r["country"], r["category"])
+        r["display_key"] = rename_key(r["key"], r["country"])
 
     white = [r for r in results if r["category"] == "white"]
     black = [r for r in results if r["category"] == "black"]
@@ -423,4 +458,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
