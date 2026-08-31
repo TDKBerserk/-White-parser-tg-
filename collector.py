@@ -36,6 +36,7 @@ import json
 import re
 import socket
 import sys
+import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
@@ -192,21 +193,21 @@ def parse_sni(key: str) -> str | None:
 # Проверка доступности через HTTP GET
 # --------------------------------------------------------------------------
 
-def check_alive(ip: str, port: int) -> bool:
-    """Строгая проверка доступности: реальное TCP-соединение с ip:port.
-
-    Раньше здесь использовался HTTP GET с мягкими эвристиками (TCP-reset
-    считался "живым"), что пропускало много мёртвых серверов — reset
-    сам по себе ничего не доказывает. Теперь требуется successful
-    TCP-connect (socket.connect_ex == 0), это единственный надёжный
-    признак того, что сервис на порту реально слушает и отвечает.
-    """
+def measure_ping(ip: str, port: int) -> float | None:
+    """TCP-пинг, как в RKP (--tcp-ping): замеряет реальное время
+    установления TCP-соединения с ip:port в миллисекундах.
+    Возвращает None, если сервер недоступен (сильнее и честнее, чем
+    просто bool: заодно даёт данные для сортировки по скорости)."""
     try:
+        start = time.perf_counter()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(CHECK_TIMEOUT)
-            return sock.connect_ex((ip, port)) == 0
+            result = sock.connect_ex((ip, port))
+            if result != 0:
+                return None
+        return round((time.perf_counter() - start) * 1000, 1)
     except (socket.timeout, OSError):
-        return False
+        return None
 
 
 def resolve_ip(host: str) -> str | None:
@@ -333,11 +334,11 @@ def lookup_countries(ips: list[str]) -> dict[str, str]:
     return countries
 
 
-def rename_key(key: str, country_code: str | None) -> str:
+def rename_key(key: str, country_code: str | None, ping_ms: float) -> str:
     base = key.split("#")[0]
     flag = country_flag(country_code)
     name = country_name_ru(country_code)
-    tag = f"{flag} {name} | onyx-tg-parser"
+    tag = f"{flag} {name} | {ping_ms:.0f}ms | onyx-tg-parser"
     from urllib.parse import quote
     return f"{base}#{quote(tag)}"
 
@@ -356,12 +357,14 @@ def process_key(key: str, ip_prefixes: set[str], sni_domains: set[str]) -> dict 
     if not ip:
         return None
 
-    if not check_alive(ip, port):
+    ping_ms = measure_ping(ip, port)
+    if ping_ms is None:
         return None
 
     sni = parse_sni(key)
     category = classify(ip, sni, ip_prefixes, sni_domains)
-    return {"key": key, "host": host, "port": port, "ip": ip, "sni": sni, "category": category}
+    return {"key": key, "host": host, "port": port, "ip": ip, "sni": sni,
+            "category": category, "ping_ms": ping_ms}
 
 
 def main():
@@ -418,8 +421,10 @@ def main():
     countries = lookup_countries([r["ip"] for r in results])
     for r in results:
         r["country"] = countries.get(r["ip"])
-        r["display_key"] = rename_key(r["key"], r["country"])
+        r["display_key"] = rename_key(r["key"], r["country"], r["ping_ms"])
 
+    # Сортировка по пингу — быстрые первыми, как у RKP
+    results.sort(key=lambda r: r["ping_ms"])
     white = [r for r in results if r["category"] == "white"]
     black = [r for r in results if r["category"] == "black"]
 
@@ -458,3 +463,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
